@@ -163,13 +163,160 @@ class TaskProcessor:
     ):
         """
         Standard processing pipeline for non-Langflow processors:
-        docling conversion + embeddings + OpenSearch indexing.
+        docling conversion + embeddings + indexing.
+
+        Routes to S3 Vectors or OpenSearch based on the configured backend.
 
         Args:
             embedding_model: Embedding model to use (defaults to the current
                 embedding model from settings)
             acl: DocumentACL instance with access control information
         """
+        from config.settings import clients
+
+        if clients.vector_store is not None:
+            return await self._process_document_s3vectors(
+                file_path=file_path,
+                file_hash=file_hash,
+                owner_user_id=owner_user_id,
+                original_filename=original_filename,
+                owner_name=owner_name,
+                owner_email=owner_email,
+                file_size=file_size,
+                connector_type=connector_type,
+                embedding_model=embedding_model,
+                is_sample_data=is_sample_data,
+            )
+
+        return await self._process_document_opensearch(
+            file_path=file_path,
+            file_hash=file_hash,
+            owner_user_id=owner_user_id,
+            original_filename=original_filename,
+            jwt_token=jwt_token,
+            owner_name=owner_name,
+            owner_email=owner_email,
+            file_size=file_size,
+            connector_type=connector_type,
+            embedding_model=embedding_model,
+            is_sample_data=is_sample_data,
+            acl=acl,
+        )
+
+    async def _process_document_s3vectors(
+        self,
+        file_path: str,
+        file_hash: str,
+        owner_user_id: str = None,
+        original_filename: str = None,
+        owner_name: str = None,
+        owner_email: str = None,
+        file_size: int = None,
+        connector_type: str = "local",
+        embedding_model: str = None,
+        is_sample_data: bool = False,
+    ):
+        """S3 Vectors indexing path."""
+        import datetime
+        import os
+        from config.settings import clients, get_embedding_model, get_openrag_config
+        from services.document_service import chunk_texts_for_embeddings
+        from utils.document_processing import extract_relevant
+        from vectorstore.base import VectorRecord
+
+        vector_store = clients.vector_store
+
+        configured_embedding_model = get_openrag_config().knowledge.embedding_model
+        embedding_model = (
+            embedding_model
+            or configured_embedding_model
+            or get_embedding_model()
+        )
+
+        # Check if already exists
+        if await vector_store.document_exists(file_hash, owner_user_id, embedding_model):
+            return {"status": "unchanged", "id": file_hash}
+
+        logger.info(
+            "Processing document with S3 Vectors",
+            embedding_model=embedding_model,
+            file_hash=file_hash,
+        )
+
+        # Parse document
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if file_ext in ('.txt', '.md'):
+            from utils.document_processing import process_text_file
+            slim_doc = process_text_file(file_path)
+            if original_filename:
+                slim_doc["filename"] = original_filename
+        else:
+            from utils.docling_client import convert_file
+            full_doc = await convert_file(file_path, httpx_client=clients.docling_http_client)
+            slim_doc = extract_relevant(full_doc)
+
+        texts = [c["text"] for c in slim_doc["chunks"]]
+
+        # Generate embeddings
+        text_batches = chunk_texts_for_embeddings(texts, max_tokens=8000)
+        embeddings = []
+        for batch in text_batches:
+            resp = await clients.patched_embedding_client.embeddings.create(
+                model=embedding_model, input=batch
+            )
+            embeddings.extend([d.embedding for d in resp.data])
+
+        # Build VectorRecords
+        filename = original_filename or slim_doc["filename"]
+        vectors = []
+        for i, (chunk, vect) in enumerate(zip(slim_doc["chunks"], embeddings)):
+            metadata = {
+                "document_id": file_hash,
+                "filename": filename,
+                "mimetype": slim_doc["mimetype"],
+                "page": chunk["page"],
+                "text": chunk["text"],
+                "embedding_model": embedding_model,
+                "embedding_dimensions": len(vect),
+                "connector_type": connector_type,
+                "indexed_time": datetime.datetime.now().isoformat(),
+            }
+            if owner_user_id is not None:
+                metadata["owner"] = owner_user_id
+            if owner_name is not None:
+                metadata["owner_name"] = owner_name
+            if owner_email is not None:
+                metadata["owner_email"] = owner_email
+            if file_size is not None:
+                metadata["file_size"] = file_size
+            if is_sample_data:
+                metadata["is_sample_data"] = "true"
+
+            vectors.append(VectorRecord(
+                key=f"{file_hash}_{i}",
+                data=vect,
+                metadata=metadata,
+            ))
+
+        await vector_store.put_vectors(vectors, owner_user_id, embedding_model)
+        return {"status": "indexed", "id": file_hash}
+
+    async def _process_document_opensearch(
+        self,
+        file_path: str,
+        file_hash: str,
+        owner_user_id: str = None,
+        original_filename: str = None,
+        jwt_token: str = None,
+        owner_name: str = None,
+        owner_email: str = None,
+        file_size: int = None,
+        connector_type: str = "local",
+        embedding_model: str = None,
+        is_sample_data: bool = False,
+        acl: "DocumentACL" = None,
+    ):
+        """Original OpenSearch indexing path."""
         import datetime
         from config.settings import (
             clients,
@@ -215,7 +362,7 @@ class TaskProcessor:
         # Check if this is a .txt or .md file - use simple processing instead of docling
         import os
         file_ext = os.path.splitext(file_path)[1].lower()
-        
+
         if file_ext in ('.txt', '.md'):
             # Simple text file processing without docling
             from utils.document_processing import process_text_file

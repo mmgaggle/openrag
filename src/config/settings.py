@@ -329,6 +329,7 @@ class AppClients:
         self._patched_async_client = None  # Private attribute - single client for all providers
         self._client_init_lock = __import__('threading').Lock()  # Lock for thread-safe initialization
         self.docling_http_client = None
+        self.vector_store = None  # VectorStore implementation (S3 Vectors or None for OpenSearch)
 
     async def initialize(self):
         os_auth = None if IBM_AUTH_ENABLED else (OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD)
@@ -410,6 +411,17 @@ class AppClients:
             logger.warning(
                 "No Langflow client initialized yet, will attempt later on first use"
             )
+
+        # Initialize VectorStore backend if configured
+        from vectorstore.factory import get_vector_backend, create_vector_store, BACKEND_S3VECTORS
+
+        if get_vector_backend() == BACKEND_S3VECTORS:
+            try:
+                self.vector_store = await create_vector_store()
+                logger.info("S3 Vectors store initialized successfully")
+            except Exception as e:
+                logger.error("Failed to initialize S3 Vectors store", error=str(e))
+                raise
 
         return self
 
@@ -613,6 +625,16 @@ class AppClients:
                 logger.error("Failed to close docling-serve HTTP client", error=str(e))
             finally:
                 self.docling_http_client = None
+
+        # Close VectorStore if it exists
+        if self.vector_store is not None:
+            try:
+                await self.vector_store.cleanup()
+                logger.info("Closed VectorStore")
+            except Exception as e:
+                logger.error("Failed to close VectorStore", error=str(e))
+            finally:
+                self.vector_store = None
 
         # Close OpenSearch client if it exists
         if self.opensearch is not None:

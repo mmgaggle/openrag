@@ -20,8 +20,7 @@ async def delete_documents_by_filename_core(
     jwt_token: str | None,
 ):
     """Shared delete-by-filename logic for v1 and non-v1 endpoints."""
-    from config.settings import get_index_name
-    from utils.opensearch_queries import build_filename_delete_body
+    from config.settings import clients
 
     normalized_filename = (filename or "").strip()
     if not normalized_filename:
@@ -36,11 +35,121 @@ async def delete_documents_by_filename_core(
             400,
         )
 
+    # Route to S3 Vectors if that backend is active
+    if clients.vector_store is not None:
+        return await _delete_by_filename_s3vectors(
+            normalized_filename, user_id, clients.vector_store
+        )
+
+    return await _delete_by_filename_opensearch(
+        normalized_filename, session_manager, user_id, jwt_token
+    )
+
+
+async def _delete_by_filename_s3vectors(filename: str, user_id: str, vector_store):
+    """Delete document chunks by filename using S3 Vectors."""
+    try:
+        # Discover which models the user has indexes for
+        models = await vector_store.list_user_models(user_id)
+        total_deleted = 0
+
+        for model in models:
+            # Query to find vectors with this filename, then delete them
+            # S3 Vectors doesn't have delete-by-query, so we query to find keys
+            # and then delete by key. We use query_vectors with a dummy embedding
+            # to find matching metadata, but that's not ideal.
+            # Instead, list all vectors and filter by filename metadata.
+            # For now, use list_vectors approach.
+            idx = await vector_store._resolve_index(user_id, model)
+            if not idx:
+                continue
+
+            import asyncio
+            loop = asyncio.get_event_loop()
+            client = await loop.run_in_executor(
+                None, lambda: vector_store._get_scoped_client(user_id, "readwrite")
+            )
+
+            # List all vectors and filter by filename in metadata
+            keys_to_delete = []
+            next_token = None
+            while True:
+                kwargs = {
+                    "vectorBucketName": vector_store.bucket_name,
+                    "indexName": idx,
+                    "maxResults": 1000,
+                }
+                if next_token:
+                    kwargs["nextToken"] = next_token
+
+                response = await loop.run_in_executor(
+                    None, lambda kw=kwargs: client.list_vectors(**kw)
+                )
+
+                for v in response.get("vectors", []):
+                    meta = v.get("metadata", {})
+                    if meta.get("filename") == filename:
+                        keys_to_delete.append(v["key"])
+
+                next_token = response.get("nextToken")
+                if not next_token:
+                    break
+
+            if keys_to_delete:
+                deleted = await vector_store.delete_vectors(
+                    keys_to_delete, user_id, model
+                )
+                total_deleted += deleted
+
+        if total_deleted == 0:
+            return (
+                {
+                    "success": False,
+                    "deleted_chunks": 0,
+                    "filename": filename,
+                    "message": None,
+                    "error": "No matching document chunks were deleted. The file may be missing or not deletable in the current user context.",
+                },
+                404,
+            )
+
+        logger.info(f"Deleted {total_deleted} chunks for filename {filename}", user_id=user_id)
+        return (
+            {
+                "success": True,
+                "deleted_chunks": total_deleted,
+                "filename": filename,
+                "message": f"All documents with filename '{filename}' deleted successfully",
+                "error": None,
+            },
+            200,
+        )
+    except Exception as e:
+        logger.error("Error deleting documents by filename", filename=filename, error=str(e))
+        return (
+            {
+                "success": False,
+                "deleted_chunks": 0,
+                "filename": filename,
+                "message": None,
+                "error": "An internal error has occurred while deleting documents",
+            },
+            500,
+        )
+
+
+async def _delete_by_filename_opensearch(
+    filename: str, session_manager, user_id: str, jwt_token: str | None,
+):
+    """Original OpenSearch delete-by-filename path."""
+    from config.settings import get_index_name
+    from utils.opensearch_queries import build_filename_delete_body
+
     try:
         opensearch_client = session_manager.get_user_opensearch_client(
             user_id, jwt_token
         )
-        delete_query = build_filename_delete_body(normalized_filename)
+        delete_query = build_filename_delete_body(filename)
         result = await opensearch_client.delete_by_query(
             index=get_index_name(),
             body=delete_query,
@@ -49,7 +158,7 @@ async def delete_documents_by_filename_core(
 
         deleted_count = result.get("deleted", 0)
         logger.info(
-            f"Deleted {deleted_count} chunks for filename {normalized_filename}",
+            f"Deleted {deleted_count} chunks for filename {filename}",
             user_id=user_id,
         )
 
@@ -58,7 +167,7 @@ async def delete_documents_by_filename_core(
                 {
                     "success": False,
                     "deleted_chunks": 0,
-                    "filename": normalized_filename,
+                    "filename": filename,
                     "message": None,
                     "error": "No matching document chunks were deleted. The file may be missing or not deletable in the current user context.",
                 },
@@ -69,8 +178,8 @@ async def delete_documents_by_filename_core(
             {
                 "success": True,
                 "deleted_chunks": deleted_count,
-                "filename": normalized_filename,
-                "message": f"All documents with filename '{normalized_filename}' deleted successfully",
+                "filename": filename,
+                "message": f"All documents with filename '{filename}' deleted successfully",
                 "error": None,
             },
             200,
@@ -78,7 +187,7 @@ async def delete_documents_by_filename_core(
     except Exception as e:
         logger.error(
             "Error deleting documents by filename",
-            filename=normalized_filename,
+            filename=filename,
             error=str(e),
         )
         error_str = str(e)
@@ -87,7 +196,7 @@ async def delete_documents_by_filename_core(
             {
                 "success": False,
                 "deleted_chunks": 0,
-                "filename": normalized_filename,
+                "filename": filename,
                 "message": None,
                 "error": (
                     "Access denied: insufficient permissions"

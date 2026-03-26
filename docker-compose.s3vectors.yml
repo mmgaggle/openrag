@@ -1,0 +1,32 @@
+# Docker Compose override for S3 Vectors backend.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.s3vectors.yml up
+#
+# This override:
+# - Removes the opensearch and dashboards services
+# - Adds S3 Vectors configuration to the backend
+# - Forces DISABLE_INGEST_WITH_LANGFLOW=true (Langflow component not yet ported)
+
+services:
+  # Disable OpenSearch — not needed with S3 Vectors
+  opensearch:
+    profiles:
+      - disabled
+
+  # Disable Dashboards — no OpenSearch to connect to
+  dashboards:
+    profiles:
+      - disabled
+
+  openrag-backend:
+    depends_on:
+      - langflow
+    environment:
+      # S3 Vectors backend
+      - VECTOR_BACKEND=s3vectors
+      - S3_VECTORS_BUCKET_NAME=${S3_VECTORS_BUCKET_NAME:-openrag-vectors}
+      - S3_VECTORS_REGION=${S3_VECTORS_REGION:-${AWS_REGION:-us-east-1}}
+      - S3_VECTORS_ROLE_ARN=${S3_VECTORS_ROLE_ARN}
+      # Force traditional processor (Langflow ingest component not ported yet)
+      - DISABLE_INGEST_WITH_LANGFLOW=true

@@ -29,6 +29,10 @@ class SearchService:
         Returns:
             dict (str, Any): {"results": [chunks]} on success
         """
+        # Route to S3 Vectors search if that backend is active
+        if clients.vector_store is not None:
+            return await self._search_s3vectors(query, embedding_model)
+
         from utils.embedding_fields import get_embedding_field_name
 
         # Strategy: Use provided model, or default to the configured embedding
@@ -488,6 +492,133 @@ class SearchService:
                 if isinstance(results.get("hits", {}).get("total"), dict)
                 else results.get("hits", {}).get("total")
             ),
+        }
+
+    async def _search_s3vectors(self, query: str, embedding_model: str = None) -> Dict[str, Any]:
+        """S3 Vectors search path — pure semantic search across per-user indexes."""
+        import asyncio
+
+        vector_store = clients.vector_store
+        embedding_model = embedding_model or get_embedding_model() or EMBED_MODEL
+
+        # Get auth context
+        user_id, jwt_token = get_auth_context()
+        from auth_context import get_search_filters, get_search_limit, get_score_threshold
+
+        filters = get_search_filters() or {}
+        limit = get_search_limit()
+        score_threshold = get_score_threshold()
+
+        if not user_id:
+            return {"results": [], "error": "Authentication required"}
+
+        is_wildcard = isinstance(query, str) and query.strip() == "*"
+
+        if is_wildcard:
+            # For wildcard queries, we can't do a vector search. Return empty
+            # results with aggregation-like data gathered from metadata.
+            return {"results": [], "aggregations": {}, "total": 0}
+
+        # Discover which models this user has indexes for
+        available_models = await vector_store.list_user_models(user_id)
+        if not available_models:
+            available_models = [embedding_model]
+
+        # Generate embeddings for all available models in parallel
+        async def embed_with_model(model_name):
+            formatted = model_name
+            if not any(model_name.startswith(p + "/") for p in ["openai", "ollama", "watsonx", "anthropic"]):
+                if ":" in model_name:
+                    formatted = f"ollama/{model_name}"
+                elif model_name in WATSONX_EMBEDDING_DIMENSIONS:
+                    formatted = f"watsonx/{model_name}"
+
+            delay = EMBED_RETRY_INITIAL_DELAY
+            for attempt in range(1, MAX_EMBED_RETRIES + 1):
+                try:
+                    resp = await clients.patched_embedding_client.embeddings.create(
+                        model=formatted, input=[query]
+                    )
+                    emb = getattr(resp.data[0], "embedding", None)
+                    if emb is None:
+                        emb = resp.data[0]["embedding"]
+                    return model_name, emb
+                except Exception as e:
+                    if attempt >= MAX_EMBED_RETRIES:
+                        logger.error("Failed to embed", model=model_name, error=str(e))
+                        raise
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, EMBED_RETRY_MAX_DELAY)
+
+        embedding_results = await asyncio.gather(
+            *[embed_with_model(m) for m in available_models],
+            return_exceptions=True,
+        )
+
+        # Build metadata filter from search filters
+        metadata_filter = {}
+        field_mapping = {
+            "data_sources": "filename",
+            "document_types": "mimetype",
+            "owners": "owner",
+            "connector_types": "connector_type",
+        }
+        for filter_key, values in filters.items():
+            if values and isinstance(values, list) and len(values) == 1:
+                field_name = field_mapping.get(filter_key, filter_key)
+                metadata_filter[field_name] = values[0]
+
+        # Query each model's index in parallel
+        async def query_model(model_name, emb_vector):
+            return await vector_store.query_vectors(
+                embedding=emb_vector,
+                user_id=user_id,
+                embedding_model=model_name,
+                top_k=min(limit, 100),
+                metadata_filter=metadata_filter if metadata_filter else None,
+            )
+
+        query_tasks = []
+        for result in embedding_results:
+            if isinstance(result, tuple):
+                model_name, emb = result
+                query_tasks.append(query_model(model_name, emb))
+
+        all_results = await asyncio.gather(*query_tasks, return_exceptions=True)
+
+        # Merge results from all models, sort by score
+        merged = []
+        for result in all_results:
+            if isinstance(result, list):
+                merged.extend(result)
+        merged.sort(key=lambda r: r.score)  # cosine distance: lower = more similar
+
+        # Apply score threshold and limit
+        chunks = []
+        for r in merged[:limit]:
+            meta = r.metadata
+            chunks.append({
+                "filename": meta.get("filename"),
+                "mimetype": meta.get("mimetype"),
+                "page": meta.get("page"),
+                "text": meta.get("text"),
+                "score": r.score,
+                "source_url": meta.get("source_url"),
+                "owner": meta.get("owner"),
+                "owner_name": meta.get("owner_name"),
+                "owner_email": meta.get("owner_email"),
+                "file_size": meta.get("file_size"),
+                "connector_type": meta.get("connector_type"),
+                "embedding_model": meta.get("embedding_model"),
+                "embedding_dimensions": meta.get("embedding_dimensions"),
+                "allowed_users": [],
+                "allowed_groups": [],
+            })
+
+        return {
+            "results": chunks,
+            "aggregations": {},
+            "total": len(chunks),
         }
 
     async def search(
